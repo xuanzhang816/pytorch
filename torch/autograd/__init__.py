@@ -71,6 +71,9 @@ def _make_grads(
             # TODO: We can remove this conditional once we uniformly use
             # singleton int to represent jagged dimension, so that size() call
             # on nested tensor works
+            if isinstance(out, graph.GradientEdge):
+                new_grads.append(grad)
+                continue
             if out.is_nested or first_grad.is_nested:
                 shape_matches = torch.is_same_size(out, first_grad)
             else:
@@ -128,6 +131,10 @@ def _make_grads(
                 )
             new_grads.append(grad)
         elif grad is None:
+            if isinstance(out, graph.GradientEdge):
+                raise RuntimeError(
+                    "grad cannot be implicitly created when output is a GradientEdge"
+                )
             if out.requires_grad:
                 if out.numel() != 1:
                     raise RuntimeError(
@@ -349,10 +356,10 @@ def grad(
         )
     if allow_unused is None:
         allow_unused = materialize_grads
-    t_outputs = cast(
-        Tuple[torch.Tensor, ...],
-        (outputs,) if is_tensor_like(outputs) else tuple(outputs),
-    )
+    if is_tensor_like(outputs) or isinstance(outputs, graph.GradientEdge):
+        t_outputs = cast(_TensorOrTensorsOrGradEdge, (outputs,))
+    else:
+        t_outputs = tuple(outputs)
     if is_tensor_like(inputs) or isinstance(inputs, graph.GradientEdge):
         inputs = cast(_TensorOrTensorsOrGradEdge, (inputs,))
     else:

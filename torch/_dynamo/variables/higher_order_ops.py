@@ -12,7 +12,7 @@ import torch._C
 import torch.fx
 import torch.nn
 import torch.onnx.operators
-from torch._dynamo.utils import get_fake_value
+from torch._dynamo.utils import deepcopy_to_fake_tensor, get_fake_value
 from torch._dynamo.variables import ConstantVariable
 from torch._dynamo.variables.base import VariableTracker
 from torch._dynamo.variables.builtin import BuiltinVariable
@@ -1153,6 +1153,7 @@ class ExecutorchCallDelegateHigherOrderVariable(TorchHigherOrderOperatorVariable
         )
 
         example_value = lowered_module.original_module.module()(*real_sub_args)
+        example_value = deepcopy_to_fake_tensor(example_value, tx.fake_mode)
 
         # NOTE [Guaranteeing the 1-1 correspondence of FakeTensors and real tensors]:
         # executorch modules promise not to alias inputs and outputs.

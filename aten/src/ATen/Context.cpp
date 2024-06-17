@@ -283,6 +283,25 @@ void Context::setBlasPreferredBackend(at::BlasBackend b) {
       "please file an issue on GitHub."
     );
   }
+#ifdef USE_ROCM
+  if (b == at::BlasBackend::Cublaslt) {
+    for (auto index = 0; index < at::getNumGPUs(); index++) {
+      hipDeviceProp_t* prop = at::cuda::getDeviceProperties(index);
+      std::string device_arch = prop->gcnArchName;
+      static const std::vector<std::string> archs = {"gfx90a", "gfx940", "gfx941", "gfx942"};
+      for (std::string arch : archs) {
+          size_t substring = device_arch.find(arch);
+          if (substring != std::string::npos) {
+              return true;
+          }
+      }
+      TORCH_WARN_ONCE(
+        "Attempting to use hipBLASLt on an unsupported architecture! "
+        "Overriding blas backend to hipblas");
+      b = at::BlasBackend::Cublas;
+    }
+  }
+#endif
   blas_preferred_backend = b;
 #endif
 }

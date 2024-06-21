@@ -1434,11 +1434,12 @@ class Scheduler:
         self.create_foreach_nodes()
         self.topological_sort_schedule()
         self.logged_slow_fusion: Set[Tuple[str, str]] = set()
-        self.fuse_nodes()
+        # self.fuse_nodes()
         self.finalize_multi_template_buffers()
         if config.reorder_for_compute_comm_overlap:
             self.nodes = comms.reorder_compute_and_comm_for_overlap(self.nodes)
         self.compute_last_usage()
+        self.get_graph_with_arc_info(fused=False)
         V.debug.ir_post_fusion(self.nodes)
         V.debug.graph_diagram(self.nodes)
         self.debug_draw_graph()
@@ -1758,6 +1759,38 @@ class Scheduler:
         # Prune any WeakDeps no longer needed
         for node in self.nodes:
             node.prune_weak_deps()
+
+    def get_graph_with_arc_info(self, fused: bool) -> None:
+        import json
+        from functorch.compile import get_graph_being_compiled
+        fname_graph = os.path.splitext(get_graph_being_compiled())
+        if fused:
+            fname = fname_graph[0] + "_fused.json"
+        else:
+            fname = fname_graph[0] + ".json"
+
+        reads_dict = dict()
+        size_dict = dict()
+        order = []
+        for node in self.nodes:
+            order.append(node.get_name())
+            reads_dict[node.get_name()] = [dep.name for dep in node.read_writes.reads]
+            for dep in node.read_writes.reads:
+                size_dict[dep.name] = dep.numbytes_hint()
+            for dep in node.read_writes.writes:
+                size_dict[dep.name] = dep.numbytes_hint()
+        reads_dict["OUTPUT"] = V.graph.get_output_names()
+        with open(os.path.join('graph_dump', fname), "w") as f:
+            json.dump(
+                {
+                    "reads": reads_dict,
+                    "size": size_dict,
+                    "order": order,
+                    "input": [name for name in size_dict.keys() if name not in reads_dict],
+                },
+                f,
+                indent=2,
+            )
 
     def topological_sort_schedule(self) -> None:
         """

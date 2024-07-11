@@ -1781,22 +1781,13 @@ class Scheduler:
             for dep in node.read_writes.writes:
                 size_dict[dep.name] = dep.numbytes_hint()
         reads_dict["OUTPUT"] = V.graph.get_output_names()
-        buf_names = set(
-            [
-                single_name
-                for buf_name in reads_dict.keys()
-                for single_name in buf_name.split("_")
-            ]
-        )
         with open(os.path.join("graph_dump", fname), "w") as f:
             json.dump(
                 {
                     "reads": reads_dict,
                     "size": size_dict,
                     "order": order,
-                    "input": [
-                        name for name in size_dict.keys() if name not in buf_names
-                    ],
+                    "input": [name for name in V.graph.graph_inputs.keys()],
                 },
                 f,
                 indent=2,

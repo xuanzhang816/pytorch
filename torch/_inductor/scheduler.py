@@ -1434,12 +1434,13 @@ class Scheduler:
         self.create_foreach_nodes()
         self.topological_sort_schedule()
         self.logged_slow_fusion: Set[Tuple[str, str]] = set()
-        # self.fuse_nodes()
+        self.get_graph_with_arc_info(fused=False)
+        self.fuse_nodes()
         self.finalize_multi_template_buffers()
         if config.reorder_for_compute_comm_overlap:
             self.nodes = comms.reorder_compute_and_comm_for_overlap(self.nodes)
         self.compute_last_usage()
-        self.get_graph_with_arc_info(fused=False)
+        self.get_graph_with_arc_info(fused=True)
         V.debug.ir_post_fusion(self.nodes)
         V.debug.graph_diagram(self.nodes)
         self.debug_draw_graph()
@@ -1780,13 +1781,22 @@ class Scheduler:
             for dep in node.read_writes.writes:
                 size_dict[dep.name] = dep.numbytes_hint()
         reads_dict["OUTPUT"] = V.graph.get_output_names()
-        with open(os.path.join('graph_dump', fname), "w") as f:
+        buf_names = set(
+            [
+                single_name
+                for buf_name in reads_dict.keys()
+                for single_name in buf_name.split("_")
+            ]
+        )
+        with open(os.path.join("graph_dump", fname), "w") as f:
             json.dump(
                 {
                     "reads": reads_dict,
                     "size": size_dict,
                     "order": order,
-                    "input": [name for name in size_dict.keys() if name not in reads_dict],
+                    "input": [
+                        name for name in size_dict.keys() if name not in buf_names
+                    ],
                 },
                 f,
                 indent=2,

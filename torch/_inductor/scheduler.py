@@ -1430,6 +1430,9 @@ class Scheduler:
         self.topological_sort_schedule()
         self.logged_slow_fusion: Set[Tuple[str, str]] = set()
         self.fuse_nodes()
+        if config.reorder_for_peak_memory:
+            self.ORM_topological_order()
+            self.topological_sort_schedule()
         self.finalize_multi_template_buffers()
         if config.reorder_for_compute_comm_overlap:
             self.nodes = comms.reorder_compute_and_comm_for_overlap(self.nodes)
@@ -1453,6 +1456,167 @@ class Scheduler:
                 "num_nodes_after_fusion": len(self.nodes),
             }
         )
+
+    def ORM_topological_order(self) -> None:
+        class ORMGraph:
+            def __init__(self):
+                self.nodes: List[ORMNode] = []
+                self.name2buffers: Dict[str, ORMBuffer] = {}
+                self.name2snodes: Dict[str, BaseSchedulerNode] = {}
+
+        class ORMBuffer:
+            def __init__(self, name: str, size: int, is_input: bool = False):
+                self.name: str = name
+                self.size: int = size
+                self.is_input: bool = is_input
+                self.outs: Set[str] = set()
+                self.deps: Set[str] = set()
+                self.unmet_deps: Set[str] = set()
+
+        class ORMNode:
+            """
+            Scheduler Node. The length of `buffers` is
+            * len(buffers) = 1 if it is NOT a FusedSchedulerNode
+            * len(buffers) > 1 if it is a FusedSchedulerNode
+            """
+
+            def __init__(self, name: str):
+                self.name: str = name
+                self.buffers: List[ORMBuffer] = []
+                self.size: int = 0
+                self.is_scheduled = False
+
+        def create_orm_buffer(
+            snode: BaseSchedulerNode,
+            g: ORMGraph,
+            orm_node: ORMNode,
+            non_dep_names: List[str] = [],
+        ) -> None:
+            buf_name = snode.get_name()
+            for dep in snode.read_writes.writes:
+                if dep.name == buf_name:
+                    buf_size = dep.numbytes_hint()
+                if dep.name in V.graph.graph_inputs.keys():
+                    g.name2buffers[dep.name].outs.add(buf_name)
+            orm_buf = ORMBuffer(buf_name, buf_size)
+            orm_buf.deps = {
+                dep.name
+                for dep in snode.read_writes.reads
+                if not dep.name in non_dep_names
+            }
+            orm_buf.unmet_deps = {
+                name for name in orm_buf.deps if not g.name2buffers[name].is_input
+            }
+            g.name2buffers[buf_name] = orm_buf
+            orm_node.buffers.append(orm_buf)
+            orm_node.size += buf_size
+
+        def pre_process() -> ORMGraph:
+            g: ORMGraph = ORMGraph()
+            for name, buf in V.graph.graph_inputs.items():
+                buf_size = V.graph.sizevars.size_hint(sympy_product(buf.get_size()))
+                orm_buf = ORMBuffer(name, buf_size, True)
+                g.name2buffers[name] = orm_buf
+
+            for snode in self.nodes:
+                g.name2snodes[snode.get_name()] = snode
+                orm_node = ORMNode(snode.get_name())
+                if not isinstance(snode, FusedSchedulerNode):
+                    create_orm_buffer(snode, g, orm_node)
+                else:
+                    non_dep_names = {
+                        single_snode.get_name() for single_snode in snode.snodes
+                    }
+                    for single_snode in snode.snodes:
+                        create_orm_buffer(single_snode, g, orm_node, non_dep_names)
+                g.nodes.append(orm_node)
+
+            for buf_name, buf in g.name2buffers.items():
+                for dep_name in buf.deps:
+                    g.name2buffers[dep_name].outs.add(buf_name)
+            return g
+
+        def sort(g: ORMGraph) -> List[str]:
+            result_order = []
+
+            live_memory = 0
+            for buf in g.name2buffers.values():
+                if buf.is_input:
+                    live_memory += buf.size
+            max_memory = live_memory
+
+            # initialize list of nodes ready to be scheduled
+            nodes_to_schedule = set()
+            for node in g.nodes:
+                can_schedule = True
+                for buf in node.buffers:
+                    if len(buf.unmet_deps) > 0:
+                        can_schedule = False
+                        break
+                if can_schedule:
+                    nodes_to_schedule.add(node)
+
+            # schedule nodes greedily one at a time
+            while nodes_to_schedule:
+                for node in nodes_to_schedule:
+                    node.peak_memory = live_memory + node.size
+                    memory_to_free = sum(
+                        g.name2buffers[dep].size
+                        for buf in node.buffers
+                        for dep in buf.deps
+                        if len(g.name2buffers[dep].outs) == 1
+                    )
+                    node.live_memory = node.peak_memory - memory_to_free
+
+                # select node to schedule:
+                #   -- among nodes with peak_mem <= max_mem, pick the one with the lowest live_memory
+                #   -- if such a node does not exist, select the one with the lowest peak_memory
+                selected_node = None
+                lite_nodes = [
+                    n for n in nodes_to_schedule if n.peak_memory <= max_memory
+                ]
+                if len(lite_nodes) > 0:
+                    selected_node = min(
+                        lite_nodes, key=lambda n: (n.live_memory, n.peak_memory, n.name)
+                    )
+                else:
+                    selected_node = min(
+                        nodes_to_schedule,
+                        key=lambda n: (n.peak_memory, n.live_memory, n.name),
+                    )
+
+                nodes_to_schedule.remove(selected_node)
+                result_order.append(selected_node.name)
+                selected_node.is_scheduled = True
+
+                # update memory usage
+                live_memory = selected_node.live_memory
+                max_memory = max(max_memory, selected_node.peak_memory)
+
+                # update unmet_deps of downstream buffers and update outs of upstream buffers
+                for buf in selected_node.buffers:
+                    for out_name in buf.outs:
+                        g.name2buffers[out_name].unmet_deps.remove(buf.name)
+                    for dep_name in buf.deps:
+                        g.name2buffers[dep_name].outs.remove(buf.name)
+
+                # update nodes_to_schedule
+                for node in g.nodes:
+                    if node.is_scheduled:
+                        continue
+                    can_schedule = True
+                    for buf in node.buffers:
+                        if len(buf.unmet_deps) > 0:
+                            can_schedule = False
+                            break
+                    if can_schedule:
+                        nodes_to_schedule.add(node)
+            return result_order
+
+        g = pre_process()
+        result_order = sort(g)
+        assert len(result_order) == len(g.nodes), "not all nodes scheduled!"
+        self.nodes = [g.name2snodes[node_name] for node_name in result_order]
 
     def get_current_device_or_throw(self) -> torch.device:
         if device := self.current_device:

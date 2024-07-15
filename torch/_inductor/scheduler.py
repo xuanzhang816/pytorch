@@ -1511,6 +1511,15 @@ class Scheduler:
             orm_node.buffers.append(orm_buf)
             orm_node.size += buf_size
 
+        def get_single_snodes_from_fused_node(snode: FusedSchedulerNode) -> List[BaseSchedulerNode]:
+            single_snodes = []
+            for single_snode in snode.snodes:
+                if not isinstance(single_snode, FusedSchedulerNode):
+                    single_snodes.append(single_snode)
+                else:
+                    single_snodes.extend(get_single_snodes_from_fused_node(single_snode))
+            return single_snodes
+
         def pre_process() -> ORMGraph:
             g: ORMGraph = ORMGraph()
             for name, buf in V.graph.graph_inputs.items():
@@ -1524,10 +1533,9 @@ class Scheduler:
                 if not isinstance(snode, FusedSchedulerNode):
                     create_orm_buffer(snode, g, orm_node)
                 else:
-                    non_dep_names = {
-                        single_snode.get_name() for single_snode in snode.snodes
-                    }
-                    for single_snode in snode.snodes:
+                    single_snodes = get_single_snodes_from_fused_node(snode)
+                    non_dep_names = [single_snode.get_name() for single_snode in single_snodes]
+                    for single_snode in single_snodes:
                         create_orm_buffer(single_snode, g, orm_node, non_dep_names)
                 g.nodes.append(orm_node)
 

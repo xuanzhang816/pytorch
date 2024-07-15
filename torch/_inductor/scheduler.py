@@ -1493,6 +1493,26 @@ class NodeUser:
 
 _post_grad_graph_counter = itertools.count()
 
+from typing import TypedDict
+
+class ORMBuffer(TypedDict):
+    name: str
+    size: int
+    is_input: bool
+    is_output: bool
+    users: List[str]
+    deps: List[str]
+    unmet_deps: List[str]
+
+class ORMNode(TypedDict):
+    name: str
+    buffer_names: List[str]
+    size: int = 0
+
+class ORMGraph(TypedDict):
+    nodes: List[ORMNode]
+    buffers: List[ORMBuffer]
+    multioutput_layout: Dict[str: List[str]]
 
 class Scheduler:
     __dep_size_hint_cache: Dict[Dep, int]
@@ -1561,6 +1581,7 @@ class Scheduler:
         if config._pre_fusion_custom_pass is not None:
             self.nodes = config._pre_fusion_custom_pass(self.nodes)
         self.nodes = self.fuse_nodes(self.nodes)
+        _ = self.dump_fused_graph()
         self.finalize_multi_template_buffers()
         if config.reorder_for_compute_comm_overlap:
             self.nodes = comms.reorder_compute_and_comm_for_overlap(self.nodes)
@@ -1585,6 +1606,120 @@ class Scheduler:
                 "num_nodes_after_fusion": len(self.nodes),
             }
         )
+
+    def dump_fused_graph(self, to_json=True) -> ORMGraph:
+        name2buffers: Dict[str, ORMBuffer] = {}
+
+        def create_orm_buffer(
+            snode: BaseSchedulerNode,
+            g: ORMGraph,
+            orm_node: ORMNode,
+            non_dep_names: Set[str] = [],
+        ) -> None:
+            buf_name = snode.node.get_name()
+            for dep in snode.read_writes.writes:
+                if dep.name == buf_name:
+                    buf_size = dep.numbytes_hint()
+            orm_buf: ORMBuffer = {
+                "name": buf_name,
+                "size": buf_size,
+                "is_input": False,
+                "is_output": False,
+                "users": [],
+                "deps": [],
+                "unmet_deps": [],
+            }
+            orm_buf["deps"] = [
+                dep.name
+                for dep in snode.read_writes.reads
+                if not dep.name in non_dep_names
+            ]
+            orm_buf["unmet_deps"] = [
+                name for name in orm_buf["deps"] if not name2buffers[name]["is_input"]
+            ]
+            name2buffers[buf_name] = orm_buf
+            orm_node["buffer_names"].append(orm_buf["name"])
+            g["buffers"].append(orm_buf)
+            orm_node["size"] += buf_size
+
+            # add information related to buffers with MultiOutputLayout
+            if isinstance(snode.node.layout, ir.MultiOutputLayout):
+                g["multioutput_layout"][buf_name] = [
+                    user.node.node.get_name()
+                    for user in self.name_to_buf[snode.node.get_name()].users
+                ]
+
+        def _get_single_snodes_from_fused_node(snode: FusedSchedulerNode) -> List[BaseSchedulerNode]:
+            single_snodes = []
+            for single_snode in snode.snodes:
+                if not isinstance(single_snode, FusedSchedulerNode):
+                    single_snodes.append(single_snode)
+                else:
+                    single_snodes.extend(_get_single_snodes_from_fused_node(single_snode))
+            return single_snodes
+
+        # create the graph object
+        g: ORMGraph = {
+            "nodes": [],
+            "buffers": [],
+            "multioutput_layout": {}
+        }
+
+        # add input buffers
+        for name, buf in V.graph.graph_inputs.items():
+            buf_size = V.graph.sizevars.size_hint(
+                sympy_product(buf.get_size())
+            ) * get_dtype_size(buf.get_dtype())
+            orm_buf: ORMBuffer = {
+                "name": name,
+                "size": buf_size,
+                "is_input": True,
+                "is_output": False,
+                "users": [],
+                "deps": [],
+                "unmet_deps": [],
+            }
+            name2buffers[name] = orm_buf
+            g["buffers"].append(orm_buf)
+
+        # add scheduler nodes
+        for snode in self.nodes:
+            orm_node: ORMNode = {
+                "name": snode.get_name(),
+                "buffer_names": [],
+                "size": 0
+            }
+            # create buffers for the scheduler nodoe
+            if not isinstance(snode, FusedSchedulerNode):
+                create_orm_buffer(snode, g, orm_node)
+            else:
+                single_snodes = _get_single_snodes_from_fused_node(snode)
+                non_dep_names = {single_snode.node.get_name() for single_snode in single_snodes}
+                for single_snode in single_snodes:
+                    create_orm_buffer(single_snode, g, orm_node, non_dep_names)
+            # add node to graph
+            g["nodes"].append(orm_node)
+
+        # populate users based on deps
+        for buf_name, buf in name2buffers.items():
+            for dep_name in buf["deps"]:
+                name2buffers[dep_name]["users"].append(buf_name)
+
+        # mark output buffers
+        for buf_name in V.graph.get_output_names():
+            name2buffers[buf_name]["is_output"] = True
+
+        # dump the graph
+        if to_json:
+            from functorch.compile import get_graph_being_compiled
+            import json
+            fname_graph = os.path.splitext(get_graph_being_compiled())[0] + "_fused.json"
+            with open(os.path.join('graph_dump_fused', fname_graph), "w") as f:
+                json.dump(g, f, indent=2)
+        
+        # return the graph
+        return g
+
 
     def get_current_device_or_throw(self) -> torch.device:
         if device := self.current_device:

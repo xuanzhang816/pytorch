@@ -447,9 +447,9 @@ class BaseSchedulerNode:
                         # update last usage of reused node
                         self.last_usage.discard(input_buf.get_name())
 
-                        V.kernel.inplace_update_buffers[
-                            buf.get_name()
-                        ] = input_buf.get_name()
+                        V.kernel.inplace_update_buffers[buf.get_name()] = (
+                            input_buf.get_name()
+                        )
                         break
 
     def codegen_originating_info(
@@ -1597,6 +1597,11 @@ class Scheduler:
         if config._pre_fusion_custom_pass is not None:
             self.nodes = config._pre_fusion_custom_pass(self.nodes)
         self.nodes = self.fuse_nodes(self.nodes)
+        if config.reorder_for_peak_memory:
+            peak_mem = self.estimate_peak_memory(self.nodes)
+            # new_order = self.topo_sort_for_peak_memory(self.nodes, peak_mem)
+            # if self.estimate_peak_memory(new_order) < peak_mem:
+            #     self.nodes = self.topological_sort_schedule(new_order)
         self.finalize_multi_template_buffers()
         if config.reorder_for_compute_comm_overlap:
             self.nodes = comms.reorder_compute_and_comm_for_overlap(self.nodes)
@@ -1847,9 +1852,9 @@ class Scheduler:
                 for alt_name in buf.get_mutations():
                     self.mutation_renames[rename(alt_name)] = buf.get_name()
                     self.mutation_renames[alt_name] = buf.get_name()
-                    self.mutation_real_name[
-                        buf.get_name()
-                    ] = self.mutation_real_name.get(alt_name, alt_name)
+                    self.mutation_real_name[buf.get_name()] = (
+                        self.mutation_real_name.get(alt_name, alt_name)
+                    )
 
         # make sure outputs aren't dead-code-eliminated
         for buf_name in V.graph.get_output_names():
@@ -1953,6 +1958,70 @@ class Scheduler:
         for node in nodes:
             visit(node)
         return result
+
+    def estimate_peak_memory(self, nodes: List[BaseSchedulerNode]) -> int:
+        """
+        Estimate and return peak memory usage given node order.
+        Also populate two quantities: self._input_mem and self._output_mem
+        """
+        @dataclasses.dataclass
+        class BufferWithInfo:
+            size: int
+            start_time: int
+            end_time: int
+
+        buffers_with_info: Dict[str, BufferWithInfo] = {}
+
+        # all input buffers are in memory at time 0
+        self._input_mem = 0
+        for name, buf in V.graph.graph_inputs.items():
+            sz = V.graph.sizevars.size_hint(
+                sympy_product(buf.get_size())
+            ) * get_dtype_size(buf.get_dtype())
+            self._input_mem += sz
+            buffers_with_info[name] = BufferWithInfo(sz, 0, 0)
+
+        # each buffer is created at the time its corresponding node is executed
+        num_nodes = len(nodes)
+        output_names = set(V.graph.get_output_names())
+        self._output_mem = 0
+        for i, node in enumerate(nodes):
+            t = i + 1
+            for dep in node.read_writes.writes:
+                sz = self.dep_size_hint(dep)
+                if dep.name in output_names:
+                    self._output_mem += sz
+                    end_time = num_nodes
+                else:
+                    end_time = t
+                buffers_with_info[name] = BufferWithInfo(sz, t, end_time)
+            # update the end_time of its predecessors
+            for dep in node.read_writes.reads:
+                buffers_with_info[dep.name].end_time = max(
+                    t, buffers_with_info[dep.name].end_time
+                )
+
+        # get incremental memories at each time period
+        incrmental_memories = [0 for _ in range(num_nodes + 1)]
+        for buf_info in buffers_with_info.values():
+            incrmental_memories[buf_info.start_time] += buf_info.size
+            if buf_info.end_time < num_nodes:
+                incrmental_memories[buf_info.end_time + 1] -= buf_info.size
+
+        # get peak memory
+        peak_memory = 0
+        cumulative_memory = 0
+        for sz in incrmental_memories:
+            cumulative_memory += sz
+            peak_memory = max(peak_memory, cumulative_memory)
+        
+        return peak_memory
+
+
+    def topo_sort_for_peak_memory(self) -> List[BaseSchedulerNode]:
+        """
+        Return a topologically sorted list of nodes that minimizes peak memory usage.
+        """
 
     def compute_ancestors(self) -> None:
         """
@@ -2423,9 +2492,9 @@ class Scheduler:
             rhs_dep = node2_name2dep[buf_name]
 
             if lhs_dep.get_numel() != rhs_dep.get_numel():
-                reasons[
-                    buf_name
-                ] = f"different numel: {lhs_dep.get_numel()} v.s. {rhs_dep.get_numel()}"
+                reasons[buf_name] = (
+                    f"different numel: {lhs_dep.get_numel()} v.s. {rhs_dep.get_numel()}"
+                )
                 continue
 
             # same numel but different MemoryDep.size. Should be broadcasting
@@ -2434,9 +2503,9 @@ class Scheduler:
                 continue
 
             if not isinstance(lhs_dep, MemoryDep) or not isinstance(rhs_dep, MemoryDep):
-                reasons[
-                    buf_name
-                ] = f"not MemoryDep: {type(lhs_dep)} v.s. {type(rhs_dep)}"
+                reasons[buf_name] = (
+                    f"not MemoryDep: {type(lhs_dep)} v.s. {type(rhs_dep)}"
+                )
                 continue
 
             lhs_off = lhs_dep.get_offset()
@@ -2456,9 +2525,9 @@ class Scheduler:
                 continue
 
             # Add more rules here
-            reasons[
-                buf_name
-            ] = f"Unknown reason: {lhs_dep} v.s. {rhs_dep}. Layout: {buf.layout}"
+            reasons[buf_name] = (
+                f"Unknown reason: {lhs_dep} v.s. {rhs_dep}. Layout: {buf.layout}"
+            )
 
         return str(reasons)
 
@@ -2746,7 +2815,7 @@ class Scheduler:
     def get_possible_fusions_with_highest_priority(
         self, possible_fusions: List[Tuple[BaseSchedulerNode, BaseSchedulerNode]]
     ) -> List[Tuple[BaseSchedulerNode, BaseSchedulerNode]]:
-        # Group the possible fusions based on their priority from the backend.
+        # Group the possible fufsions based on their priority from the backend.
         # Only return the group of possible fusions with highest priority.
         if len(possible_fusions) == 0:
             return possible_fusions

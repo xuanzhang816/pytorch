@@ -1597,11 +1597,9 @@ class Scheduler:
         if config._pre_fusion_custom_pass is not None:
             self.nodes = config._pre_fusion_custom_pass(self.nodes)
         self.nodes = self.fuse_nodes(self.nodes)
-        if config.reorder_for_peak_memory:
-            peak_mem = self.estimate_peak_memory(self.nodes)
-            # new_order = self.topo_sort_for_peak_memory(self.nodes, peak_mem)
-            # if self.estimate_peak_memory(new_order) < peak_mem:
-            #     self.nodes = self.topological_sort_schedule(new_order)
+        # if config.reorder_for_peak_memory:
+        if True:
+            self.topo_sort_for_peak_memory(self.nodes)
         self.finalize_multi_template_buffers()
         if config.reorder_for_compute_comm_overlap:
             self.nodes = comms.reorder_compute_and_comm_for_overlap(self.nodes)
@@ -1959,69 +1957,177 @@ class Scheduler:
             visit(node)
         return result
 
-    def estimate_peak_memory(self, nodes: List[BaseSchedulerNode]) -> int:
-        """
-        Estimate and return peak memory usage given node order.
-        Also populate two quantities: self._input_mem and self._output_mem
-        """
-        @dataclasses.dataclass
-        class BufferWithInfo:
-            size: int
-            start_time: int
-            end_time: int
+    
+    def topo_sort_for_peak_memory(
+        self, nodes: List[BaseSchedulerNode]
+    )-> List[BaseSchedulerNode]:
 
-        buffers_with_info: Dict[str, BufferWithInfo] = {}
+        # TODO: change list to set
+        # the size written to by each node and by each buffer
+        node2size: Dict[str, int] = collections.defaultdict(int)
+        buffer2size: Dict[str, int] = collections.defaultdict(int)
+        # the set of buffers created by each node
+        node2buffers: Dict[str, List[str]] = collections.defaultdict(list)
+        # the set of preds of each node 
+        node2preds: Dict[str, List[str]] = collections.defaultdict(list)
+        # the set of succs of each buffer
+        buffer2succs: Dict[str, List[str]] = collections.defaultdict(list)
 
-        # all input buffers are in memory at time 0
-        self._input_mem = 0
-        for name, buf in V.graph.graph_inputs.items():
-            sz = V.graph.sizevars.size_hint(
-                sympy_product(buf.get_size())
-            ) * get_dtype_size(buf.get_dtype())
-            self._input_mem += sz
-            buffers_with_info[name] = BufferWithInfo(sz, 0, 0)
-
-        # each buffer is created at the time its corresponding node is executed
         num_nodes = len(nodes)
-        output_names = set(V.graph.get_output_names())
-        self._output_mem = 0
-        for i, node in enumerate(nodes):
-            t = i + 1
-            for dep in node.read_writes.writes:
-                sz = self.dep_size_hint(dep)
-                if dep.name in output_names:
-                    self._output_mem += sz
-                    end_time = num_nodes
-                else:
-                    end_time = t
-                buffers_with_info[name] = BufferWithInfo(sz, t, end_time)
-            # update the end_time of its predecessors
-            for dep in node.read_writes.reads:
-                buffers_with_info[dep.name].end_time = max(
-                    t, buffers_with_info[dep.name].end_time
+        graph_inputs = set(V.graph.graph_inputs.keys())
+        graph_outputs = set(V.graph.get_output_names())
+
+        def _get_node_buffer_size_dependencies() -> (int, int):
+            input_memory = 0
+            output_memory = 0
+            for node in self.nodes:
+                node_name = node.get_name()
+                for dep in node.read_writes.writes:
+                    buffer2size[dep.name] = self.dep_size_hint(dep)
+                    node2size[node_name] += buffer2size[dep.name]
+                    if dep.name in graph_outputs:
+                        output_memory += buffer2size[dep.name]
+
+                for dep in node.read_writes.reads:
+                    if dep.name in graph_inputs and dep.name not in buffer2size:
+                        buffer2size[dep.name] = self.dep_size_hint(dep)
+                        input_memory += buffer2size[dep.name]
+
+                for buffer in node.get_outputs():
+                    node2buffers[node_name].append(buffer.get_name())
+                    for dep in buffer.defining_op.read_writes.reads:
+                        node2preds[node_name].append(dep.name)
+                        buffer2succs[dep.name].append(node_name)
+                # consider the case of a fused node buf1_buf2, where buf2 reads buf1
+                # in this case, the preds of the fused node should not contain buf1
+                node2preds[node_name] = list(
+                    set(node2preds[node_name]) - set(node2buffers[node_name])
                 )
+            return (input_memory, output_memory)
 
-        # get incremental memories at each time period
-        incrmental_memories = [0 for _ in range(num_nodes + 1)]
-        for buf_info in buffers_with_info.values():
-            incrmental_memories[buf_info.start_time] += buf_info.size
-            if buf_info.end_time < num_nodes:
-                incrmental_memories[buf_info.end_time + 1] -= buf_info.size
 
-        # get peak memory
-        peak_memory = 0
-        cumulative_memory = 0
-        for sz in incrmental_memories:
-            cumulative_memory += sz
-            peak_memory = max(peak_memory, cumulative_memory)
+        def _estimate_peak_memory(nodes: List[BaseSchedulerNode]) -> int:
+            """
+            Estimate and return peak memory usage given node order.
+            """
+            @dataclasses.dataclass
+            class BufferDuration:
+                start_time: int
+                end_time: int
+
+            buffers_duration: Dict[str, BufferDuration] = {}
+            
+            for i, node in enumerate(nodes):
+                t = i + 1
+                node_name = node.get_name()
+                for dep in node.read_writes.writes:
+                    buffers_duration[dep.name] = BufferDuration(
+                        t, 
+                        num_nodes if dep.name in graph_outputs else t
+                    )
+                for dep in node.read_writes.reads:
+                    if dep.name in graph_inputs and dep.name not in buffers_duration:
+                        buffers_duration[dep.name] = BufferDuration(0, 0)
+                    buffers_duration[dep.name].end_time = max(
+                        t, buffers_duration[dep.name].end_time
+                    )
+
+            # get incremental memories at each time period
+            incrmental_memories = [0 for _ in range(num_nodes + 1)]
+            for name, buffer_duration in buffers_duration.items():
+                incrmental_memories[buffer_duration.start_time] += buffer2size[name]
+                if buffer_duration.end_time < num_nodes:
+                    incrmental_memories[buffer_duration.end_time + 1] -= buffer2size[name]
+
+            # get peak memory
+            peak_memory = 0
+            cumulative_memory = 0
+            for sz in incrmental_memories:
+                cumulative_memory += sz
+                peak_memory = max(peak_memory, cumulative_memory)
+            return peak_memory
+
         
-        return peak_memory
+        def _select_by_live_peak_memory(
+            scheduled_nodes: List[BaseSchedulerNode] = [], max_memory: int = math.inf
+        ) -> List[BaseSchedulerNode]:
+            """
+            Select the node with the largest live peak memory.
+            """
+
+            def _get_live_max_memory_if_schedule(node_name: str) -> (int, int):
+                node_max_memory = live_memory + node2size[node_name]
+                node_live_memory = node_max_memory - sum(
+                    buf2size[buffer_name]
+                    for buffer_name in node2preds[node_name]
+                    if (
+                        buffer_to_num_unmet_succs[buffer_name] == 1 
+                        and buffer_name not in graph_outputs
+                    )
+                )
+                return (node_max_memory, node_live_memory)
+            
+            def _update_after_schedule(node_name: str, node_max_memory: int, node_live_memory: int) -> None:
+                max_memory = max(max_memory, node_max_memory)
+                live_memory = node_live_memory
+                for buffer_name in node2preds[node_name]:
+                    buffer_to_num_unmet_succs[buffer_name] -= 1
+                for buffer_name in node2buffers[node_name]:
+                    for succ_node_name in buffer2size[buffer_name]:
+                    node_to_num_unmet_preds[succ_node_name] -= 1
 
 
-    def topo_sort_for_peak_memory(self) -> List[BaseSchedulerNode]:
-        """
-        Return a topologically sorted list of nodes that minimizes peak memory usage.
-        """
+            node_to_num_unmet_preds: Dict[str, int] = collections.defaultdict(int)
+            buffer_to_num_unmet_succs: Dict[str, int] = collections.defaultdict(int)
+            for node_name, preds in node2preds.items():
+                node_to_num_unmet_preds[node_name] = len(
+                    [pred for pred in preds if pred not in graph_inputs]
+                )
+            for buffer_name, succs in buffer2succs.items():
+                buffer_to_num_unmet_succs[buffer_name] = len(succs)
+                
+            live_memory = input_memory
+            for node in scheduled_nodes:
+                node_max_memory, node_live_memory = _get_live_max_memory_if_schedule(node.get_name())
+                _update_after_schedule(node.get_name(), node_max_memory, node_live_memory)
+
+
+            nodes_to_schedule: Set[BaseSchedulerNode] = set()
+            result: List[BaseSchedulerNode] = []
+
+            for node in nodes:
+                if num_unmet_preds[node.get_name()] == 0:
+                    nodes_to_schedule.add(node)
+            
+            # live_memory = input_memory
+            # for node in nodes_to_schedule:
+                
+        
+        
+        
+        
+        
+        
+        
+        input_memory, output_memory = _get_node_buffer_size_dependencies()
+            
+        import json
+        print(json.dumps(node2size, indent=4))
+        print(json.dumps(node2buffers, indent=4))
+        print(json.dumps(buffer2size, indent=4))
+        print(json.dumps(node2preds, indent=4))
+        print(json.dumps(buffer2succs, indent=4))
+
+        peak_memory = _estimate_peak_memory(nodes)
+
+        print(f"input memory is {input_memory}")
+        print(f"peak memory is {peak_memory}")
+        print(f"output memory is {output_memory}")
+
+
+
+        return nodes
+
 
     def compute_ancestors(self) -> None:
         """

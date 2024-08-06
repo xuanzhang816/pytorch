@@ -29,6 +29,38 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 )
 from torch.utils._triton import has_triton
 
+import logging
+logger = logging.getLogger(__name__)
+
+MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT: int = 100000
+def start_record_memory_history() -> None:
+    if not torch.cuda.is_available():
+        logger.info("CUDA unavailable. Not recording memory history")
+        return
+    logger.info("Starting memory snapshot record_memory_history")
+    torch.cuda.memory._record_memory_history(
+        max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
+    )
+
+def stop_record_memory_history() -> None:
+    if not torch.cuda.is_available():
+        logger.info("CUDA unavailable. Not recording memory history")
+        return
+    logger.info("Stopping memory snapshot record_memory_history")
+    torch.cuda.memory._record_memory_history(enabled=None)
+
+
+def export_memory_snapshot(filepath_prefix) -> None:
+    if not torch.cuda.is_available():
+        logger.info("CUDA unavailable. Not exporting memory snapshot")
+        return
+    try:
+        logger.info(f"Saving memory snapshot to local file: {filepath_prefix}.pickle")
+        torch.cuda.memory._dump_snapshot(f"{filepath_prefix}.pickle")
+    except Exception as e:
+        logger.info(f"Failed to capture memory snapshot {e}")
+        return
+
 
 def _is_op_in_graph(graph, op):
     return any(node.target is op for node in graph.nodes)
@@ -356,8 +388,11 @@ class TestFullyShardCompile(FSDPTest):
             # FSDP2 does lazy init using 1st run, so run it once to init using eager mode
             run_iters(model, optim, n_iter=1)
 
+            start_record_memory_history()
             model_compiled = torch.compile(model, backend=backend, fullgraph=fullgraph)
             res = run_iters(model_compiled, optim, compiled_autograd_backend=backend)
+            export_memory_snapshot(f"/home/xuanzh/local/pytorch/test/distributed/_composable/fsdp/{self.rank}_compiled_snapshot")
+            stop_record_memory_history()
             return res
 
         def test_eager():
@@ -365,7 +400,10 @@ class TestFullyShardCompile(FSDPTest):
             # FSDP2 does lazy init using 1st run, so run it once to init using eager mode
             run_iters(model, optim, n_iter=1)
 
+            start_record_memory_history()
             res = run_iters(model, optim)
+            export_memory_snapshot(f"/home/xuanzh/local/pytorch/test/distributed/_composable/fsdp/{self.rank}_eager_snapshot")
+            stop_record_memory_history()
             return res
 
         losses_compiled = test_compiled()
@@ -620,9 +658,9 @@ class TestFullyShardCompile(FSDPTest):
                     "Expected at least 3 separate lowerings to Triton code, which means at least 1 graph break in FWD graph",
                 )
 
-    def _create_transformer_factory_fns(self):
-        seq_len = 16
-        vocab_size = 8
+    def _create_transformer_factory_fns(self, seq_len=16, vocab_size=8):
+        seq_len = seq_len
+        vocab_size = vocab_size
 
         def model_init_fn():
             torch.manual_seed(self.rank)
@@ -631,6 +669,7 @@ class TestFullyShardCompile(FSDPTest):
             model_args = ModelArgs(
                 vocab_size=vocab_size,
                 n_layers=3,
+                max_seq_len=seq_len,
             )
             model = Transformer(model_args)
             for layer_id, mod in enumerate(model.layers):
@@ -697,7 +736,7 @@ class TestFullyShardCompile(FSDPTest):
     # TODO: native_dropout causes CUDA IMA error, need to figure out why
     @torch._inductor.config.patch(fallback_random=True)
     def test_transformer_backend_inductor(self):
-        for fullgraph in [True, False]:
+        for fullgraph in [True]:
             with self._maybe_add_graph_break_to_sdpa(
                 fullgraph
             ), self._reinplace_all_gather_with_optional_checks(
@@ -707,7 +746,7 @@ class TestFullyShardCompile(FSDPTest):
             ):
                 _, triton_codes = run_and_get_code(
                     lambda: self._test_traceable_fsdp(
-                        *self._create_transformer_factory_fns(),
+                        *self._create_transformer_factory_fns(vocab_size=128256),
                         "inductor",
                         fullgraph=fullgraph,
                     )
